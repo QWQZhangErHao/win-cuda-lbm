@@ -217,7 +217,7 @@ void k_lbm_odd(
     const uint8_t* __restrict__ solid,
     float tau0, float nu0, float cs2,
     int nx, int ny, int nz, size_t ncells,
-    float gy, int periodic_y, float tau_min, float tau_max
+    float u_in, float gy, int periodic_y, float tau_min, float tau_max
 ) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -268,8 +268,11 @@ void k_lbm_odd(
             if (periodic_y) {
                 if (ys < 0) ys += ny; else if (ys >= ny) ys -= ny;
             }
-            if (ys < 0 || ys >= ny) {
-                ff[i] = f[(size_t)c_opp[i] * ncells + idx];
+            if (ys < 0) {
+                float cu = 3.0f * (float)c_ey[i] * u_in;
+                ff[i] = c_w[i] * (1.0f + cu + 0.5f * cu * cu - 1.5f * u_in * u_in);
+            } else if (ys >= ny) {
+                ff[i] = c_w[i];
             } else {
                 size_t nb_idx = (size_t)zs * stride_z + (size_t)ys * (size_t)nx + (size_t)xs;
                 if (__ldg(&solid[nb_idx])) {
@@ -536,7 +539,7 @@ void k_thermal_odd(
     const float* __restrict__ f,
     const uint8_t* __restrict__ thermal_bc,
     int nx, int ny, int nz, size_t ncells,
-    int periodic_y, float t_hot, float tau_t_fluid, float tau_t_solid, int flip_f
+    int periodic_y, float t_in, float t_hot, float tau_t_fluid, float tau_t_solid, int flip_f
 ) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -579,8 +582,10 @@ void k_thermal_odd(
             if (periodic_y) {
                 if (ys < 0) ys += ny; else if (ys >= ny) ys -= ny;
             }
-            if (ys < 0 || ys >= ny) {
-                gg[i] = g[(size_t)ct_opp[i] * ncells + idx];
+            if (ys < 0) {
+                gg[i] = ct_w[i] * t_in;
+            } else if (ys >= ny) {
+                gg[i] = ct_w[i] * t_in;
             } else {
                 size_t nb_idx = (size_t)zs * stride_z + (size_t)ys * (size_t)nx + (size_t)xs;
                 gg[i] = g[(size_t)ct_opp[i] * ncells + nb_idx];
@@ -708,7 +713,7 @@ static void enqueue_one_step(LBMHandle* h, int step_parity) {
     } else {
         k_lbm_odd<<<grd3, blk3, 0, h->stream>>>(
             h->d_f, h->d_solid, h->tau0, h->nu0, h->cs2,
-            h->nx, h->ny, h->nz, h->ncells, h->gy, h->periodic_y, h->tau_min, h->tau_max);
+            h->nx, h->ny, h->nz, h->ncells, h->u_in, h->gy, h->periodic_y, h->tau_min, h->tau_max);
         if (!h->periodic_y) {
             k_apply_bc<<<grd2, blk2, 0, h->stream>>>(
                 h->d_f, h->u_in, h->nx, h->ny, h->nz, h->ncells, 0);
@@ -717,7 +722,7 @@ static void enqueue_one_step(LBMHandle* h, int step_parity) {
             k_thermal_odd<<<grd3, blk3, 0, h->stream>>>(
                 h->d_g, h->d_f, h->d_thermal_bc,
                 h->nx, h->ny, h->nz, h->ncells,
-                h->periodic_y, h->t_hot, h->tau_t_fluid, h->tau_t_solid, 0);
+                h->periodic_y, h->t_in, h->t_hot, h->tau_t_fluid, h->tau_t_solid, 0);
             if (!h->periodic_y) {
                 k_apply_thermal_bc<<<grd2, blk2, 0, h->stream>>>(
                     h->d_g, h->d_thermal_bc, h->t_in, h->nx, h->ny, h->nz, h->ncells, 0);

@@ -74,7 +74,7 @@ def build_heatsink(pitch_mm=0.4, pad_y=20.0):
 
 
 def main():
-    pitch_mm, u_phys, steps = 0.4, 2.5, 2000
+    pitch_mm, u_phys, steps = 0.4, 2.5, 6000
     t_in, t_hot = 25.0, 65.0
     u_lat = 0.05
     gap_mm = 2.488 - 0.3
@@ -101,24 +101,29 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     out_png = os.path.join(out_dir, "heatsink_thermal_demo.png")
 
-    fig, axes = plt.subplots(2, 1, figsize=(10.5, 6.2), dpi=160, constrained_layout=True)
-    u_plot = np.ma.masked_where(solid[mid].T, uy.T)
-    t_plot = np.ma.masked_where(solid[mid].T, temp.T)
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 6.0), dpi=160, constrained_layout=True)
+    # 剔除 y=ny-1 出口边界层并采用真实物理坐标 (mm) 与 1:1 等比例显示
+    u_plot = np.ma.masked_where(solid[mid, :-1, :].T, uy[:-1, :].T)
+    t_plot = np.ma.masked_where(solid[mid, :-1, :].T, temp[:-1, :].T)
+    extent = [0.0, (ny - 1) * pitch_mm, 0.0, nx * pitch_mm]
 
     cmap_u = plt.get_cmap("RdYlBu_r").copy()
     cmap_u.set_bad(color="#2b2b2b")
-    im0 = axes[0].imshow(u_plot, origin="lower", cmap=cmap_u, vmin=-0.02, vmax=0.09, aspect="auto")
-    axes[0].set_title(f"3D Finned Heat Sink ({solid.size/1e6:.2f}M Voxels) — Streamwise Velocity u_y", fontsize=11, fontweight="bold")
-    axes[0].set_ylabel("Width X")
-    fig.colorbar(im0, ax=axes[0], pad=0.015, fraction=0.025)
+    im0 = axes[0].imshow(u_plot, origin="lower", cmap=cmap_u, vmin=-0.02, vmax=0.09,
+                         aspect="equal", extent=extent)
+    axes[0].set_title(f"Velocity u_y (lattice) | {solid.size/1e6:.2f}M voxels, {steps} steps", fontsize=10.5, fontweight="bold")
+    axes[0].set_xlabel("Airflow Y (mm)")
+    axes[0].set_ylabel("Width X (mm)")
+    fig.colorbar(im0, ax=axes[0], pad=0.02, fraction=0.045)
 
     cmap_t = plt.get_cmap("inferno").copy()
     cmap_t.set_bad(color="#d9d9d9")
-    im1 = axes[1].imshow(t_plot, origin="lower", cmap=cmap_t, vmin=t_in, vmax=t_hot, aspect="auto")
-    axes[1].set_title(f"D3Q7 Conjugate Heat Transfer — Temperature (°C) | T_in={t_in}°C, T_hot={t_hot}°C", fontsize=11, fontweight="bold")
-    axes[1].set_xlabel("Airflow Direction Y")
-    axes[1].set_ylabel("Width X")
-    fig.colorbar(im1, ax=axes[1], pad=0.015, fraction=0.025)
+    im1 = axes[1].imshow(t_plot, origin="lower", cmap=cmap_t, vmin=t_in, vmax=t_hot,
+                         aspect="equal", extent=extent)
+    axes[1].set_title(f"D3Q7 Temperature (°C) | T_in={t_in}°C, T_hot={t_hot}°C", fontsize=10.5, fontweight="bold")
+    axes[1].set_xlabel("Airflow Y (mm)")
+    axes[1].set_ylabel("Width X (mm)")
+    fig.colorbar(im1, ax=axes[1], pad=0.02, fraction=0.045)
 
     fig.savefig(out_png, dpi=160)
     plt.close(fig)
