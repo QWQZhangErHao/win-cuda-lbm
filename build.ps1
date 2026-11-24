@@ -33,7 +33,7 @@ $bat = Join-Path $tmp "build.bat"
 call "$vcvars"
 if errorlevel 1 exit /b 1
 cd /d "$tmp"
-nvcc -O3 --use_fast_math -arch=$Arch -shared -Xcompiler "/O2 /MD /utf-8" -o lbm_cuda.dll lbm_cuda.cu
+nvcc -std=c++17 -O3 --use_fast_math -arch=$Arch -shared -Xcompiler "/O2 /MD /utf-8 /Zc:preprocessor /std:c++17" -o lbm_cuda.dll lbm_cuda.cu
 exit /b %errorlevel%
 "@ | Set-Content -Path $bat -Encoding ASCII
 

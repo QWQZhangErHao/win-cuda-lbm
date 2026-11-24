@@ -71,6 +71,15 @@ def load_lib(dll_path: str = _DLL) -> ctypes.CDLL:
     lib.lbm_get_x_slice.restype = ctypes.c_int
     lib.lbm_get_x_temp_slice.argtypes = [ctypes.c_void_p, ctypes.c_int, cf_p]
     lib.lbm_get_x_temp_slice.restype = ctypes.c_int
+    lib.lbm_compute_metrics.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+        cf_p, cf_p, cf_p, cf_p, cf_p,
+    ]
+    lib.lbm_compute_metrics.restype = ctypes.c_int
+    lib.lbm_extract_fields_3d.argtypes = [
+        ctypes.c_void_p, cf_p, cf_p, cf_p, cf_p, cf_p,
+    ]
+    lib.lbm_extract_fields_3d.restype = ctypes.c_int
     lib.lbm_destroy.argtypes = [ctypes.c_void_p]
     lib.lbm_destroy.restype = None
     _LIB = lib
@@ -165,6 +174,44 @@ class LBMCudaSolver:
             temp.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         )
         return temp
+
+    def compute_metrics(self, y_in: int, y_out: int):
+        mu, ri, ro, to, tmax = (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(),
+                                ctypes.c_float(), ctypes.c_float())
+        rc = self._lib.lbm_compute_metrics(
+            self._h, int(y_in), int(y_out),
+            ctypes.byref(mu), ctypes.byref(ri), ctypes.byref(ro),
+            ctypes.byref(to), ctypes.byref(tmax),
+        )
+        if rc != 0:
+            raise RuntimeError("lbm_compute_metrics failed")
+        return {
+            "mean_uy": float(mu.value),
+            "rho_in": float(ri.value),
+            "rho_out": float(ro.value),
+            "t_out": float(to.value),
+            "t_max_solid": float(tmax.value),
+        }
+
+    def extract_fields_3d(self, with_thermal: bool = True):
+        shape = (self.nz, self.ny, self.nx)
+        ux = np.empty(shape, dtype=np.float32)
+        uy = np.empty(shape, dtype=np.float32)
+        uz = np.empty(shape, dtype=np.float32)
+        rho = np.empty(shape, dtype=np.float32)
+        temp = np.empty(shape, dtype=np.float32) if with_thermal else None
+        t_ptr = temp.ctypes.data_as(ctypes.POINTER(ctypes.c_float)) if temp is not None else None
+        rc = self._lib.lbm_extract_fields_3d(
+            self._h,
+            ux.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            uy.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            uz.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            rho.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            t_ptr,
+        )
+        if rc != 0:
+            raise RuntimeError("lbm_extract_fields_3d failed")
+        return ux, uy, uz, rho, temp
 
     def close(self):
         if getattr(self, "_h", None):

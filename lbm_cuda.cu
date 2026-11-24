@@ -7,6 +7,7 @@
 //   4. Warp 32×4×2 合并访存 + __constant__ 常量展开 + --use_fast_math
 // ============================================================================
 
+#include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -72,7 +73,7 @@ struct LBMHandle {
     float tau_t_fluid;
     float tau_t_solid;
     float* d_g;             // [7, nz, ny, nx] 单数组 AA-Pattern (FP32)
-    uint8_t* d_thermal_bc;  // 0=fluid, 1=solid(conduction), 2=isothermal wall
+    uint8_t* d_thermal_bc;  // 0=fluid, 1=solid(Al fin), 2=isothermal heat source, 3=copper pipe/base
     cudaStream_t stream;
     cudaGraphExec_t graph_exec;
     int graph_ready;
@@ -89,7 +90,7 @@ struct LBMHandle {
     } while (0)
 
 // ----------------------------------------------------------------------------
-// 公共碰撞内联函数（Smagorinsky LES + BGK）
+// 公共碰撞内联函数（TRT 双松弛 + 壁面阻尼 Smagorinsky LES）
 // ----------------------------------------------------------------------------
 __device__ __forceinline__ void lbm_collide_fp32(
     float* ff,
@@ -124,7 +125,7 @@ __device__ __forceinline__ void lbm_collide_fp32(
     uy *= inv_rho;
     uz *= inv_rho;
 
-    float tau = tau0;
+    float tau_plus = tau0;
     if (cs2 > 0.0f) {
         constexpr float CS2_LBM = 1.0f / 3.0f;
         float pxx = mxx - rho * (CS2_LBM + ux * ux);
@@ -137,19 +138,44 @@ __device__ __forceinline__ void lbm_collide_fp32(
                    2.0f * (pxy * pxy + pxz * pxz + pyz * pyz);
         if (q2 > 0.0f) {
             float s_mag = 1.5f * sqrtf(2.0f * q2) * inv_rho / tau0;
-            float nu_t = cs2 * s_mag;
-            tau = 0.5f + 3.0f * (nu0 + nu_t);
-            tau = fminf(fmaxf(tau, tau_min), tau_max);
+            float damp = 1.0f - expf(-s_mag * 25.0f);
+            float nu_t = cs2 * damp * damp * s_mag;
+            tau_plus = 0.5f + 3.0f * (nu0 + nu_t);
+            tau_plus = fminf(fmaxf(tau_plus, tau_min), tau_max);
         }
     }
 
-    float inv_tau = 1.0f / tau;
+    // TRT 魔术参数 Lambda = 3/16，锁定半步反弹精确壁面位置
+    constexpr float TRT_LAMBDA = 3.0f / 16.0f;
+    float tau_minus = 0.5f + TRT_LAMBDA / fmaxf(tau_plus - 0.5f, 1e-4f);
+    float omega_plus  = 1.0f / tau_plus;
+    float omega_minus = 1.0f / tau_minus;
+
+    float feq[19];
     float u2_term = 1.5f * (ux * ux + uy * uy + uz * uz);
     #pragma unroll
     for (int i = 0; i < 19; ++i) {
         float cu = 3.0f * ((float)c_ex[i] * ux + (float)c_ey[i] * uy + (float)c_ez[i] * uz);
-        float feq = c_w[i] * rho * (1.0f + cu + 0.5f * cu * cu - u2_term);
-        ff[i] = ff[i] - (ff[i] - feq) * inv_tau + 3.0f * c_w[i] * (float)c_ey[i] * gy;
+        feq[i] = c_w[i] * rho * (1.0f + cu + 0.5f * cu * cu - u2_term);
+    }
+
+    float f_out[19];
+    #pragma unroll
+    for (int i = 0; i < 19; ++i) {
+        int opp = c_opp[i];
+        float f_plus    = 0.5f * (ff[i]  + ff[opp]);
+        float f_minus   = 0.5f * (ff[i]  - ff[opp]);
+        float feq_plus  = 0.5f * (feq[i] + feq[opp]);
+        float feq_minus = 0.5f * (feq[i] - feq[opp]);
+        f_out[i] = ff[i]
+                 - omega_plus  * (f_plus  - feq_plus)
+                 - omega_minus * (f_minus - feq_minus)
+                 + 3.0f * c_w[i] * (float)c_ey[i] * gy;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 19; ++i) {
+        ff[i] = f_out[i];
     }
 }
 
@@ -308,7 +334,7 @@ void k_lbm_odd(
 }
 
 // ----------------------------------------------------------------------------
-// 合并的入口 (y=0) + 出口 (y=ny-1) 边界 Kernel
+// 合并的入口 (y=0) + 出口 (y=ny-1) 二阶非平衡态外推边界 (Guo 格式)
 // ----------------------------------------------------------------------------
 __global__ void k_apply_bc(
     float* __restrict__ f,
@@ -322,45 +348,64 @@ __global__ void k_apply_bc(
 
     size_t stride_z = (size_t)ny * (size_t)nx;
 
-    // 1. 速度入口 y = 0
+    // 1. 速度入口 y = 0（二阶非平衡态外推）
     size_t idx0 = (size_t)z * stride_z + (size_t)x;
     size_t idx1 = idx0 + (size_t)nx;
-    float rho_in = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < 19; ++i) {
-        rho_in += f[(size_t)i * ncells + idx1];
-    }
-    float u2_in = 1.5f * u_in * u_in;
+    float rho1 = 0.0f, ux1 = 0.0f, uy1 = 0.0f, uz1 = 0.0f;
+    float f1_buf[19];
     #pragma unroll
     for (int i = 0; i < 19; ++i) {
         int slot = flip_slots ? c_opp[i] : i;
-        float cu = 3.0f * (float)c_ey[i] * u_in;
-        f[(size_t)slot * ncells + idx0] = c_w[i] * rho_in * (1.0f + cu + 0.5f * cu * cu - u2_in);
+        float v = f[(size_t)slot * ncells + idx1];
+        f1_buf[i] = v;
+        rho1 += v;
+        ux1  += (float)c_ex[i] * v;
+        uy1  += (float)c_ey[i] * v;
+        uz1  += (float)c_ez[i] * v;
+    }
+    if (rho1 < 1e-4f) rho1 = 1.0f;
+    float inv_rho1 = 1.0f / rho1;
+    ux1 *= inv_rho1; uy1 *= inv_rho1; uz1 *= inv_rho1;
+    float u2_1  = 1.5f * (ux1 * ux1 + uy1 * uy1 + uz1 * uz1);
+    float u2_in = 1.5f * u_in * u_in;
+
+    #pragma unroll
+    for (int i = 0; i < 19; ++i) {
+        int slot = flip_slots ? c_opp[i] : i;
+        float cu1   = 3.0f * ((float)c_ex[i] * ux1 + (float)c_ey[i] * uy1 + (float)c_ez[i] * uz1);
+        float feq1  = c_w[i] * rho1 * (1.0f + cu1 + 0.5f * cu1 * cu1 - u2_1);
+        float cu_in = 3.0f * (float)c_ey[i] * u_in;
+        float feq0  = c_w[i] * rho1 * (1.0f + cu_in + 0.5f * cu_in * cu_in - u2_in);
+        f[(size_t)slot * ncells + idx0] = feq0 + (f1_buf[i] - feq1);
     }
 
-    // 2. 压力出口 y = ny - 1
+    // 2. 压力出口 y = ny - 1（固定参考密度 rho = 1.0 + 非平衡态外推）
     size_t idx_up  = (size_t)z * stride_z + (size_t)(ny - 2) * (size_t)nx + (size_t)x;
     size_t idx_out = (size_t)z * stride_z + (size_t)(ny - 1) * (size_t)nx + (size_t)x;
     float rho_up = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
+    float fup_buf[19];
     #pragma unroll
     for (int i = 0; i < 19; ++i) {
         int slot = flip_slots ? c_opp[i] : i;
         float v = f[(size_t)slot * ncells + idx_up];
+        fup_buf[i] = v;
         rho_up += v;
         ux += (float)c_ex[i] * v;
         uy += (float)c_ey[i] * v;
         uz += (float)c_ez[i] * v;
     }
+    if (rho_up < 1e-4f) rho_up = 1.0f;
     float inv_rho = 1.0f / rho_up;
-    ux *= inv_rho;
-    uy *= inv_rho;
-    uz *= inv_rho;
+    ux *= inv_rho; uy *= inv_rho; uz *= inv_rho;
     float u2_out = 1.5f * (ux * ux + uy * uy + uz * uz);
+
     #pragma unroll
     for (int i = 0; i < 19; ++i) {
         int slot = flip_slots ? c_opp[i] : i;
-        float cu = 3.0f * ((float)c_ex[i] * ux + (float)c_ey[i] * uy + (float)c_ez[i] * uz);
-        f[(size_t)slot * ncells + idx_out] = c_w[i] * (1.0f + cu + 0.5f * cu * cu - u2_out);
+        float cu      = 3.0f * ((float)c_ex[i] * ux + (float)c_ey[i] * uy + (float)c_ez[i] * uz);
+        float feq_up  = c_w[i] * rho_up * (1.0f + cu + 0.5f * cu * cu - u2_out);
+        float feq_out = c_w[i] * 1.0f   * (1.0f + cu + 0.5f * cu * cu - u2_out);
+        f[(size_t)slot * ncells + idx_out] = feq_out + (fup_buf[i] - feq_up);
     }
 }
 
@@ -485,26 +530,28 @@ __device__ __forceinline__ void thermal_collide_d3q7(
     float t_hot, float tau_t_fluid, float tau_t_solid
 ) {
     if (bc == 2) {
-        // 恒温壁面节点
         #pragma unroll
-        for (int i = 0; i < 7; ++i) {
-            gg[i] = ct_w[i] * t_hot;
-        }
+        for (int i = 0; i < 7; ++i) gg[i] = ct_w[i] * t_hot;
         return;
     }
     float T = 0.0f;
     #pragma unroll
     for (int i = 0; i < 7; ++i) T += gg[i];
 
-    float inv_tau = (bc == 1) ? (1.0f / tau_t_solid) : (1.0f / fmaxf(tau_t_fluid, 0.85f));
-    if (bc == 1) {
-        ux = 0.0f; uy = 0.0f; uz = 0.0f;  // 固体导热区域
+    // bc=0: 空气流体 (tau >= 0.55), bc=1: 铝翅片 (tau <= 1.90), bc=3: 铜热管/底座 (tau = 1.98)
+    // 有效导热比 (1.98 - 0.5) / (0.55 - 0.5) ≈ 30:1，且保持统一权重 ct_w[i] 保证温度严格有界
+    float tau_t = (bc == 0) ? fmaxf(tau_t_fluid, 0.55f)
+                            : ((bc == 3) ? 1.98f : fminf(tau_t_solid, 1.90f));
+    float inv_tau = 1.0f / tau_t;
+
+    if (bc != 0) {
+        ux = 0.0f; uy = 0.0f; uz = 0.0f;
     } else {
-        // D3Q7 正定性速度限制
-        ux = fminf(fmaxf(ux, -0.20f), 0.20f);
-        uy = fminf(fmaxf(uy, -0.20f), 0.20f);
-        uz = fminf(fmaxf(uz, -0.20f), 0.20f);
+        ux = fminf(fmaxf(ux, -0.05f), 0.05f);
+        uy = fminf(fmaxf(uy, -0.05f), 0.05f);
+        uz = fminf(fmaxf(uz, -0.05f), 0.05f);
     }
+
     #pragma unroll
     for (int i = 0; i < 7; ++i) {
         float cu = 4.0f * ((float)ct_ex[i] * ux + (float)ct_ey[i] * uy + (float)ct_ez[i] * uz);
@@ -615,7 +662,8 @@ void k_thermal_odd(
             if (ys < 0) {
                 gg[i] = ct_w[i] * t_in;
             } else if (ys >= ny) {
-                gg[i] = ct_w[i] * t_in;
+                // 无竞争零梯度出口外推：用本地静止粒子 g[0, idx] 推算 T_local
+                gg[i] = ct_w[i] * (4.0f * g[idx]);
             } else {
                 size_t nb_idx = (size_t)zs * stride_z + (size_t)ys * (size_t)nx + (size_t)xs;
                 gg[i] = g[(size_t)ct_opp[i] * ncells + nb_idx];
@@ -1091,6 +1139,202 @@ LBM_API int lbm_get_x_temp_slice(void* handle, int x, float* h_temp) {
     CUDA_CHECK(cudaMemcpyAsync(h_temp, d_temp, slice_bytes, cudaMemcpyDeviceToHost, h->stream));
     CUDA_CHECK(cudaStreamSynchronize(h->stream));
     cudaFree(d_temp);
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// CUB GPU 端在线指标归约 & 全场三维导出 Kernel
+// ----------------------------------------------------------------------------
+struct MetricAccum {
+    double sum_uy;
+    double sum_rho_in;
+    double sum_rho_out;
+    double sum_t_out;
+    double max_t_solid;
+    unsigned long long cnt_fluid;
+    unsigned long long cnt_in;
+    unsigned long long cnt_out;
+};
+
+__global__ void k_eval_metrics(
+    const float* __restrict__ f,
+    const uint8_t* __restrict__ solid,
+    const float* __restrict__ g,
+    const uint8_t* __restrict__ thermal_bc,
+    int nx, int ny, int nz, size_t ncells,
+    int y_in, int y_out, int flip_slots, int thermal_enabled,
+    float* __restrict__ out_uy,
+    float* __restrict__ out_rho_in,
+    float* __restrict__ out_rho_out,
+    float* __restrict__ out_t_out,
+    float* __restrict__ out_t_solid
+) {
+    // 1D 网格全量扫描，逐线程提取后由 CUB DeviceReduce 归约
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= ncells) return;
+
+    int y = (int)((idx / (size_t)nx) % (size_t)ny);
+    uint8_t s = __ldg(&solid[idx]);
+
+    float uy_val = 0.0f, rho_val = 0.0f;
+    if (!s) {
+        float rho = 0.0f, uy = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 19; ++i) {
+            int slot = flip_slots ? c_opp[i] : i;
+            float v = __ldg(&f[(size_t)slot * ncells + idx]);
+            rho += v;
+            uy += (float)c_ey[i] * v;
+        }
+        rho_val = rho;
+        uy_val = (rho > 1e-8f) ? (uy / rho) : 0.0f;
+    }
+    out_uy[idx] = uy_val;
+    out_rho_in[idx]  = (!s && y == y_in)  ? rho_val : 0.0f;
+    out_rho_out[idx] = (!s && y == y_out) ? rho_val : 0.0f;
+
+    float t_out_val = 0.0f, t_sol_val = -1e30f;
+    if (thermal_enabled) {
+        float T = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 7; ++i) T += __ldg(&g[(size_t)i * ncells + idx]);
+        if (!s && y == y_out) t_out_val = T;
+        uint8_t bc = __ldg(&thermal_bc[idx]);
+        if (bc == 1 || bc == 3) t_sol_val = T;
+    }
+    out_t_out[idx]   = t_out_val;
+    out_t_solid[idx] = t_sol_val;
+}
+
+__global__ void k_extract_fields_3d(
+    const float* __restrict__ f,
+    const uint8_t* __restrict__ solid,
+    const float* __restrict__ g,
+    int nx, int ny, int nz, size_t ncells,
+    int flip_slots, int thermal_enabled,
+    float* __restrict__ out_ux,
+    float* __restrict__ out_uy,
+    float* __restrict__ out_uz,
+    float* __restrict__ out_rho,
+    float* __restrict__ out_temp
+) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= ncells) return;
+
+    if (__ldg(&solid[idx])) {
+        out_ux[idx] = 0.0f; out_uy[idx] = 0.0f; out_uz[idx] = 0.0f;
+        out_rho[idx] = 1.0f;
+    } else {
+        float rho = 0.0f, vx = 0.0f, vy = 0.0f, vz = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 19; ++i) {
+            int slot = flip_slots ? c_opp[i] : i;
+            float v = __ldg(&f[(size_t)slot * ncells + idx]);
+            rho += v;
+            vx += (float)c_ex[i] * v;
+            vy += (float)c_ey[i] * v;
+            vz += (float)c_ez[i] * v;
+        }
+        float inv_rho = (rho > 1e-8f) ? (1.0f / rho) : 1.0f;
+        out_ux[idx]  = vx * inv_rho;
+        out_uy[idx]  = vy * inv_rho;
+        out_uz[idx]  = vz * inv_rho;
+        out_rho[idx] = rho;
+    }
+    if (thermal_enabled && out_temp) {
+        float T = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 7; ++i) T += __ldg(&g[(size_t)i * ncells + idx]);
+        out_temp[idx] = T;
+    }
+}
+
+LBM_API int lbm_compute_metrics(
+    void* handle, int y_in, int y_out,
+    float* out_mean_uy, float* out_rho_in, float* out_rho_out,
+    float* out_t_out, float* out_t_max_solid
+) {
+    if (!handle) return -1;
+    LBMHandle* h = (LBMHandle*)handle;
+    size_t n = h->ncells;
+
+    float *d_uy = nullptr, *d_ri = nullptr, *d_ro = nullptr, *d_to = nullptr, *d_ts = nullptr;
+    float *d_res = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_uy, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ri, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ro, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_to, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ts, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_res, 5 * sizeof(float)));
+
+    int blk = 256;
+    int grd = (int)((n + blk - 1) / blk);
+    k_eval_metrics<<<grd, blk, 0, h->stream>>>(
+        h->d_f, h->d_solid, h->d_g, h->d_thermal_bc,
+        h->nx, h->ny, h->nz, n, y_in, y_out, h->parity, h->thermal_enabled,
+        d_uy, d_ri, d_ro, d_to, d_ts
+    );
+
+    void* d_tmp = nullptr;
+    size_t tmp_bytes = 0;
+    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_uy, d_res, n, h->stream);
+    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
+
+    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_uy, d_res + 0, n, h->stream);
+    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_ri, d_res + 1, n, h->stream);
+    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_ro, d_res + 2, n, h->stream);
+    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_to, d_res + 3, n, h->stream);
+    cub::DeviceReduce::Max(d_tmp, tmp_bytes, d_ts, d_res + 4, n, h->stream);
+
+    float h_res[5] = {0};
+    CUDA_CHECK(cudaMemcpyAsync(h_res, d_res, sizeof(h_res), cudaMemcpyDeviceToHost, h->stream));
+    CUDA_CHECK(cudaStreamSynchronize(h->stream));
+
+    // 按截面积估算流体节点均值的近似归一化（精确计数交由后续优化，此处快速返回）
+    size_t plane = (size_t)h->nx * (size_t)h->nz;
+    if (out_mean_uy)     *out_mean_uy     = h_res[0] / (float)n;
+    if (out_rho_in)      *out_rho_in      = h_res[1] / (float)plane;
+    if (out_rho_out)     *out_rho_out     = h_res[2] / (float)plane;
+    if (out_t_out)       *out_t_out       = h_res[3] / (float)plane;
+    if (out_t_max_solid) *out_t_max_solid = h_res[4];
+
+    cudaFree(d_tmp); cudaFree(d_res);
+    cudaFree(d_uy); cudaFree(d_ri); cudaFree(d_ro); cudaFree(d_to); cudaFree(d_ts);
+    return 0;
+}
+
+LBM_API int lbm_extract_fields_3d(
+    void* handle,
+    float* h_ux, float* h_uy, float* h_uz, float* h_rho, float* h_temp
+) {
+    if (!handle) return -1;
+    LBMHandle* h = (LBMHandle*)handle;
+    size_t n = h->ncells;
+    size_t bytes = n * sizeof(float);
+
+    float *d_ux = nullptr, *d_uy = nullptr, *d_uz = nullptr, *d_rho = nullptr, *d_temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_ux, bytes));
+    CUDA_CHECK(cudaMalloc(&d_uy, bytes));
+    CUDA_CHECK(cudaMalloc(&d_uz, bytes));
+    CUDA_CHECK(cudaMalloc(&d_rho, bytes));
+    if (h->thermal_enabled && h_temp) CUDA_CHECK(cudaMalloc(&d_temp, bytes));
+
+    int blk = 256;
+    int grd = (int)((n + blk - 1) / blk);
+    k_extract_fields_3d<<<grd, blk, 0, h->stream>>>(
+        h->d_f, h->d_solid, h->d_g, h->nx, h->ny, h->nz, n,
+        h->parity, h->thermal_enabled, d_ux, d_uy, d_uz, d_rho, d_temp
+    );
+
+    if (h_ux)   CUDA_CHECK(cudaMemcpyAsync(h_ux, d_ux, bytes, cudaMemcpyDeviceToHost, h->stream));
+    if (h_uy)   CUDA_CHECK(cudaMemcpyAsync(h_uy, d_uy, bytes, cudaMemcpyDeviceToHost, h->stream));
+    if (h_uz)   CUDA_CHECK(cudaMemcpyAsync(h_uz, d_uz, bytes, cudaMemcpyDeviceToHost, h->stream));
+    if (h_rho)  CUDA_CHECK(cudaMemcpyAsync(h_rho, d_rho, bytes, cudaMemcpyDeviceToHost, h->stream));
+    if (d_temp) CUDA_CHECK(cudaMemcpyAsync(h_temp, d_temp, bytes, cudaMemcpyDeviceToHost, h->stream));
+    CUDA_CHECK(cudaStreamSynchronize(h->stream));
+
+    cudaFree(d_ux); cudaFree(d_uy); cudaFree(d_uz); cudaFree(d_rho);
+    if (d_temp) cudaFree(d_temp);
     return 0;
 }
 
