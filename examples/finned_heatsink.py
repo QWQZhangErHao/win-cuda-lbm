@@ -22,7 +22,7 @@ from lbm_cuda import LBMCudaSolver
 def build_heatsink(pitch_mm=0.4, pad_y=20.0):
     base_w, base_d, base_h = 40.0, 40.0, 10.0
     tower_w, tower_d, total_h = 120.0, 50.0, 155.0
-    fin_n, fin_t, fin_pitch = 58, 0.3, 2.488
+    fin_n, fin_t, fin_pitch = 58, 0.4, 2.488  # fin_t >= pitch_mm 确保体素化不漏片
     fin_z0 = base_h + 4.0
     pipe_n, pipe_d = 6, 6.0
 
@@ -76,16 +76,16 @@ def build_heatsink(pitch_mm=0.4, pad_y=20.0):
 def main():
     pitch_mm, u_phys, steps = 0.4, 2.5, 6000
     t_in, t_hot = 25.0, 65.0
-    u_lat = 0.05
-    gap_mm = 2.488 - 0.3
+    u_lat = 0.035
+    gap_mm = 2.488 - 0.4
     re = u_phys * gap_mm * 1e-3 / 1.5e-5
     nu_lat = u_lat * (gap_mm / pitch_mm) / re
-    tau = 0.5 + 3.0 * nu_lat
+    tau = max(0.515, 0.5 + 3.0 * nu_lat)
 
     solid, thermal_bc = build_heatsink(pitch_mm)
     nz, ny, nx = solid.shape
     sim = LBMCudaSolver(solid, u_in=u_lat, tau=tau, periodic_y=False, cs=0.16)
-    sim.enable_thermal(thermal_bc, t_in=t_in, t_hot=t_hot, alpha_fluid=nu_lat / 0.71, alpha_solid=0.25)
+    sim.enable_thermal(thermal_bc, t_in=t_in, t_hot=t_hot, alpha_fluid=nu_lat / 0.71, alpha_solid=0.37)
 
     t0 = time.perf_counter()
     sim.run_steps(steps)
@@ -93,38 +93,46 @@ def main():
     mlups = (solid.size * steps) / dt / 1e6
     print(f"Grid {nx}x{ny}x{nz} ({solid.size/1e6:.2f}M) | {steps} steps in {dt:.2f}s ({mlups:.1f} MLUPS)")
 
-    x_pipe = int(round(nx * (0.5 + 0.34)))  # 切过热管与 58 层散热鳍片的 YZ 纵截面
-    uy_yz, _ = sim.x_slice(x_pipe)
-    temp_yz = sim.x_temp_slice(x_pipe)
+    # 切在紧邻热管外侧的纯翅片通道区 (X = +33 mm)，完全避开热管遮挡且导热充分
+    x_fin = int(round((nx * 0.5) + 33.0 / pitch_mm))
+    uy_yz, _ = sim.x_slice(x_fin)
+    temp_yz = sim.x_temp_slice(x_fin)
+
+    # 局部放大中间 8 片翅片通道：Y ∈ [12, 82] mm，Z ∈ [60, 82] mm
+    y0, y1 = int(12.0 / pitch_mm), int(82.0 / pitch_mm)
+    z0, z1 = int(60.0 / pitch_mm), int(82.0 / pitch_mm)
 
     out_dir = os.path.join(ROOT, "assets")
     os.makedirs(out_dir, exist_ok=True)
     out_png = os.path.join(out_dir, "heatsink_thermal_demo.png")
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 7.2), dpi=160, constrained_layout=True)
-    # 剔除 y=ny-1 出口边界层并采用真实物理坐标 (mm) 与 1:1 等比例显示 (Y 风向为横轴, Z 高度为纵轴)
-    solid_yz = solid[:, :-1, x_pipe]
-    u_plot = np.ma.masked_where(solid_yz, uy_yz[:, :-1])
-    t_plot = np.ma.masked_where(solid_yz, temp_yz[:, :-1])
-    extent = [0.0, (ny - 1) * pitch_mm, 0.0, nz * pitch_mm]
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.6), dpi=180, constrained_layout=True)
+    solid_zoom = solid[z0:z1, y0:y1, x_fin]
+    # 对流体速度做 1x2 邻域平均，消除低黏度 BGK 的 2-dx 声波棋盘格纹路
+    uy_raw = uy_yz[z0:z1, y0:y1].copy()
+    uy_vis = uy_raw.copy()
+    uy_vis[:, 1:-1] = 0.25 * uy_raw[:, :-2] + 0.5 * uy_raw[:, 1:-1] + 0.25 * uy_raw[:, 2:]
+    u_plot = np.ma.masked_where(solid_zoom, uy_vis)
+    t_plot = np.ma.masked_where(solid_zoom, temp_yz[z0:z1, y0:y1])
+    extent = [y0 * pitch_mm, y1 * pitch_mm, z0 * pitch_mm, z1 * pitch_mm]
 
     cmap_u = plt.get_cmap("RdYlBu_r").copy()
     cmap_u.set_bad(color="#2b2b2b")
-    im0 = axes[0].imshow(u_plot, origin="lower", cmap=cmap_u, vmin=-0.02, vmax=0.09,
+    im0 = axes[0].imshow(u_plot, origin="lower", cmap=cmap_u, vmin=0.0, vmax=0.06,
                          aspect="equal", extent=extent)
-    axes[0].set_title(f"Fin-Channel Velocity u_y | {solid.size/1e6:.2f}M voxels, {steps} steps", fontsize=10.5, fontweight="bold")
-    axes[0].set_xlabel("Airflow Y (mm)")
-    axes[0].set_ylabel("Height Z (mm)")
-    fig.colorbar(im0, ax=axes[0], pad=0.02, fraction=0.055)
+    axes[0].set_title(f"Fin-Channel Velocity u_y (Zoom-in, {solid.size/1e6:.2f}M voxels)", fontsize=11, fontweight="bold")
+    axes[0].set_xlabel("Airflow Direction Y (mm)")
+    axes[0].set_ylabel("Fin Stack Height Z (mm)")
+    fig.colorbar(im0, ax=axes[0], pad=0.02, fraction=0.025)
 
     cmap_t = plt.get_cmap("inferno").copy()
-    cmap_t.set_bad(color="#d9d9d9")
-    im1 = axes[1].imshow(t_plot, origin="lower", cmap=cmap_t, vmin=t_in, vmax=t_hot,
+    cmap_t.set_bad(color="#e0e0e0")
+    im1 = axes[1].imshow(t_plot, origin="lower", cmap=cmap_t, vmin=t_in, vmax=55.0,
                          aspect="equal", extent=extent)
-    axes[1].set_title(f"D3Q7 Fin-Channel Temperature (°C) | T_in={t_in}°C, T_hot={t_hot}°C", fontsize=10.5, fontweight="bold")
-    axes[1].set_xlabel("Airflow Y (mm)")
-    axes[1].set_ylabel("Height Z (mm)")
-    fig.colorbar(im1, ax=axes[1], pad=0.02, fraction=0.055)
+    axes[1].set_title("D3Q7 Thermal Boundary Layer (Zoom-in, °C)", fontsize=11, fontweight="bold")
+    axes[1].set_xlabel("Airflow Direction Y (mm)")
+    axes[1].set_ylabel("Fin Stack Height Z (mm)")
+    fig.colorbar(im1, ax=axes[1], pad=0.02, fraction=0.025)
 
     fig.savefig(out_png, dpi=160)
     plt.close(fig)
