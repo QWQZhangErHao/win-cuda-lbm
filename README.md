@@ -2,6 +2,9 @@
 
 Windows native CUDA C++ D3Q19/D3Q7 Lattice Boltzmann solver (BGK + Smagorinsky LES + Conjugate Heat Transfer), compiled directly with `nvcc` + MSVC into a standalone DLL (`lbm_cuda.dll`) with zero Docker / WSL / Linux dependency.
 
+![3D Finned Heat Sink Flow and Thermal Simulation](assets/heatsink_thermal_demo.png)
+*26.19M-voxel 3D finned heat sink with staggered heat pipes: D3Q19 velocity field (top) & D3Q7 conjugate heat transfer temperature wake (bottom), simulated on a single RTX 5070 Ti Laptop GPU.*
+
 ## Features
 
 - **D3Q19 Fluid**: BGK + Smagorinsky SGS turbulence (`Cs`), half-way bounce-back, periodic x/z, velocity inlet / pressure outlet along y.
@@ -26,7 +29,11 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 # Or specify target architecture explicitly (e.g. A100: sm_80)
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Arch sm_80
 
+# Verify Poiseuille analytical benchmark
 python .\lbm_cuda.py
+
+# Run 26.19M-voxel 3D finned heat sink CHT example (requires matplotlib)
+python .\examples\finned_heatsink.py
 ```
 
 ## Benchmark

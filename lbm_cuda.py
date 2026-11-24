@@ -136,6 +136,14 @@ class LBMCudaSolver:
         )
         return uy, rho
 
+    def z_temp_slice(self, z: int):
+        temp = np.empty((self.ny, self.nx), dtype=np.float32)
+        self._lib.lbm_get_z_temp_slice(
+            self._h, int(z),
+            temp.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        return temp
+
     def close(self):
         if getattr(self, "_h", None):
             self._lib.lbm_destroy(self._h)
