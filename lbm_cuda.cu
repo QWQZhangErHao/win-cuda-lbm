@@ -1160,6 +1160,12 @@ LBM_API int lbm_get_x_temp_slice(void* handle, int x, float* h_temp) {
 // ----------------------------------------------------------------------------
 // CUB BlockReduce + double 精度零临时显存归约 & Z 分块三维场导出 Kernel
 // ----------------------------------------------------------------------------
+struct MaxFloatOp {
+    __device__ __forceinline__ float operator()(float a, float b) const {
+        return fmaxf(a, b);
+    }
+};
+
 __device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
     int* addr_as_i = (int*)addr;
     int old = *addr_as_i, assumed;
@@ -1230,7 +1236,7 @@ __global__ void k_reduce_metrics_fused(
     unsigned long long b_cf = BlockReduceU(temp_storage.u).Sum(loc_cf); __syncthreads();
     unsigned long long b_ci = BlockReduceU(temp_storage.u).Sum(loc_ci); __syncthreads();
     unsigned long long b_co = BlockReduceU(temp_storage.u).Sum(loc_co); __syncthreads();
-    float b_ts = BlockReduceF(temp_storage.f).Reduce(loc_ts, cub::Max());
+    float b_ts = BlockReduceF(temp_storage.f).Reduce(loc_ts, MaxFloatOp());
 
     if (threadIdx.x == 0) {
         atomicAdd(&out->sum_uy, b_uy);
