@@ -2,8 +2,14 @@
 
 Windows native CUDA C++ D3Q19/D3Q7 Lattice Boltzmann solver (BGK + Smagorinsky LES + Conjugate Heat Transfer), compiled directly with `nvcc` + MSVC into a standalone DLL (`lbm_cuda.dll`) with zero Docker / WSL / Linux dependency.
 
-![3D Finned Heat Sink Flow and Thermal Simulation](assets/heatsink_thermal_demo.png)
-*26.19M-voxel 3D finned heat sink with staggered heat pipes: D3Q19 velocity field (top) & D3Q7 conjugate heat transfer temperature wake (bottom), simulated on a single RTX 5070 Ti Laptop GPU.*
+![Fin-Channel Flow and Thermal Boundary Layer](assets/heatsink_thermal_demo.png)
+*1. Pure fin-channel zoom-in (YZ plane): parabolic channel flow (left) & D3Q7 thermal boundary layer growth (right).*
+
+![Staggered Heat-Pipe Wake](assets/heatsink_pipe_wake.png)
+*2. Staggered heat-pipe wake (XY plane): velocity deficit & thermal wake downstream of 6 isothermal heat pipes.*
+
+![Front Cross-Section](assets/heatsink_front_xz.png)
+*3. Front cross-section (XZ plane): 58 stacked fins, heated baseplate, and heat-pipe thermal plume (`26.19M voxels, 1324 MLUPS on RTX 5070 Ti`).*
 
 ## Features
 
