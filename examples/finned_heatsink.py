@@ -93,37 +93,38 @@ def main():
     mlups = (solid.size * steps) / dt / 1e6
     print(f"Grid {nx}x{ny}x{nz} ({solid.size/1e6:.2f}M) | {steps} steps in {dt:.2f}s ({mlups:.1f} MLUPS)")
 
-    mid = nz // 2
-    uy, _ = sim.z_slice(mid)
-    temp = sim.z_temp_slice(mid)
+    x_pipe = int(round(nx * (0.5 + 0.34)))  # 切过热管与 58 层散热鳍片的 YZ 纵截面
+    uy_yz, _ = sim.x_slice(x_pipe)
+    temp_yz = sim.x_temp_slice(x_pipe)
 
     out_dir = os.path.join(ROOT, "assets")
     os.makedirs(out_dir, exist_ok=True)
     out_png = os.path.join(out_dir, "heatsink_thermal_demo.png")
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 6.0), dpi=160, constrained_layout=True)
-    # 剔除 y=ny-1 出口边界层并采用真实物理坐标 (mm) 与 1:1 等比例显示
-    u_plot = np.ma.masked_where(solid[mid, :-1, :].T, uy[:-1, :].T)
-    t_plot = np.ma.masked_where(solid[mid, :-1, :].T, temp[:-1, :].T)
-    extent = [0.0, (ny - 1) * pitch_mm, 0.0, nx * pitch_mm]
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 7.2), dpi=160, constrained_layout=True)
+    # 剔除 y=ny-1 出口边界层并采用真实物理坐标 (mm) 与 1:1 等比例显示 (Y 风向为横轴, Z 高度为纵轴)
+    solid_yz = solid[:, :-1, x_pipe]
+    u_plot = np.ma.masked_where(solid_yz, uy_yz[:, :-1])
+    t_plot = np.ma.masked_where(solid_yz, temp_yz[:, :-1])
+    extent = [0.0, (ny - 1) * pitch_mm, 0.0, nz * pitch_mm]
 
     cmap_u = plt.get_cmap("RdYlBu_r").copy()
     cmap_u.set_bad(color="#2b2b2b")
     im0 = axes[0].imshow(u_plot, origin="lower", cmap=cmap_u, vmin=-0.02, vmax=0.09,
                          aspect="equal", extent=extent)
-    axes[0].set_title(f"Velocity u_y (lattice) | {solid.size/1e6:.2f}M voxels, {steps} steps", fontsize=10.5, fontweight="bold")
+    axes[0].set_title(f"Fin-Channel Velocity u_y | {solid.size/1e6:.2f}M voxels, {steps} steps", fontsize=10.5, fontweight="bold")
     axes[0].set_xlabel("Airflow Y (mm)")
-    axes[0].set_ylabel("Width X (mm)")
-    fig.colorbar(im0, ax=axes[0], pad=0.02, fraction=0.045)
+    axes[0].set_ylabel("Height Z (mm)")
+    fig.colorbar(im0, ax=axes[0], pad=0.02, fraction=0.055)
 
     cmap_t = plt.get_cmap("inferno").copy()
     cmap_t.set_bad(color="#d9d9d9")
     im1 = axes[1].imshow(t_plot, origin="lower", cmap=cmap_t, vmin=t_in, vmax=t_hot,
                          aspect="equal", extent=extent)
-    axes[1].set_title(f"D3Q7 Temperature (°C) | T_in={t_in}°C, T_hot={t_hot}°C", fontsize=10.5, fontweight="bold")
+    axes[1].set_title(f"D3Q7 Fin-Channel Temperature (°C) | T_in={t_in}°C, T_hot={t_hot}°C", fontsize=10.5, fontweight="bold")
     axes[1].set_xlabel("Airflow Y (mm)")
-    axes[1].set_ylabel("Width X (mm)")
-    fig.colorbar(im1, ax=axes[1], pad=0.02, fraction=0.045)
+    axes[1].set_ylabel("Height Z (mm)")
+    fig.colorbar(im1, ax=axes[1], pad=0.02, fraction=0.055)
 
     fig.savefig(out_png, dpi=160)
     plt.close(fig)

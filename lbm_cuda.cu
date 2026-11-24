@@ -427,6 +427,36 @@ __global__ void k_extract_z_slice(
     out_uy[slice_idx] = (rho > 1e-8f) ? (uy / rho) : 0.0f;
 }
 
+__global__ void k_extract_x_slice(
+    const float* __restrict__ f,
+    const uint8_t* __restrict__ solid,
+    float* __restrict__ out_rho,
+    float* __restrict__ out_uy,
+    int x, int nx, int ny, int nz, size_t ncells, int flip_slots
+) {
+    int y = blockIdx.x * blockDim.x + threadIdx.x;
+    int z = blockIdx.y * blockDim.y + threadIdx.y;
+    if (y >= ny || z >= nz) return;
+
+    size_t slice_idx = (size_t)z * (size_t)ny + (size_t)y;
+    size_t idx = (size_t)z * (size_t)ny * (size_t)nx + (size_t)y * (size_t)nx + (size_t)x;
+    if (__ldg(&solid[idx])) {
+        out_rho[slice_idx] = 0.0f;
+        out_uy[slice_idx] = 0.0f;
+        return;
+    }
+    float rho = 0.0f, uy = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 19; ++i) {
+        int slot = flip_slots ? c_opp[i] : i;
+        float v = __ldg(&f[(size_t)slot * ncells + idx]);
+        rho += v;
+        uy += (float)c_ey[i] * v;
+    }
+    out_rho[slice_idx] = rho;
+    out_uy[slice_idx] = (rho > 1e-8f) ? (uy / rho) : 0.0f;
+}
+
 // ============================================================================
 // D3Q7 共轭传热温度场 Kernel（AA-Pattern 单数组：流体对流扩散 + 翅片导热 + 恒温热源）
 // ============================================================================
@@ -674,6 +704,22 @@ __global__ void k_extract_z_temp_slice(
     if (x >= nx || y >= ny) return;
     size_t slice_idx = (size_t)y * (size_t)nx + (size_t)x;
     size_t idx = (size_t)z * (size_t)ny * (size_t)nx + slice_idx;
+    float T = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 7; ++i) T += __ldg(&g[(size_t)i * ncells + idx]);
+    out_temp[slice_idx] = T;
+}
+
+__global__ void k_extract_x_temp_slice(
+    const float* __restrict__ g,
+    float* __restrict__ out_temp,
+    int x, int nx, int ny, int nz, size_t ncells
+) {
+    int y = blockIdx.x * blockDim.x + threadIdx.x;
+    int z = blockIdx.y * blockDim.y + threadIdx.y;
+    if (y >= ny || z >= nz) return;
+    size_t slice_idx = (size_t)z * (size_t)ny + (size_t)y;
+    size_t idx = (size_t)z * (size_t)ny * (size_t)nx + (size_t)y * (size_t)nx + (size_t)x;
     float T = 0.0f;
     #pragma unroll
     for (int i = 0; i < 7; ++i) T += __ldg(&g[(size_t)i * ncells + idx]);
@@ -1000,6 +1046,48 @@ LBM_API int lbm_get_z_temp_slice(void* handle, int z, float* h_temp) {
     dim3 grd((h->nx + blk.x - 1) / blk.x, (h->ny + blk.y - 1) / blk.y);
     k_extract_z_temp_slice<<<grd, blk, 0, h->stream>>>(
         h->d_g, d_temp, z, h->nx, h->ny, h->nz, h->ncells);
+    CUDA_CHECK(cudaMemcpyAsync(h_temp, d_temp, slice_bytes, cudaMemcpyDeviceToHost, h->stream));
+    CUDA_CHECK(cudaStreamSynchronize(h->stream));
+    cudaFree(d_temp);
+    return 0;
+}
+
+LBM_API int lbm_get_x_slice(void* handle, int x, float* h_rho, float* h_uy) {
+    if (!handle) return -1;
+    LBMHandle* h = (LBMHandle*)handle;
+    if (x < 0 || x >= h->nx) return -1;
+
+    size_t slice_bytes = (size_t)h->nz * (size_t)h->ny * sizeof(float);
+    float *d_rho = nullptr, *d_uy = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_rho, slice_bytes));
+    CUDA_CHECK(cudaMalloc(&d_uy, slice_bytes));
+
+    dim3 blk(32, 8);
+    dim3 grd((h->ny + blk.x - 1) / blk.x, (h->nz + blk.y - 1) / blk.y);
+    k_extract_x_slice<<<grd, blk, 0, h->stream>>>(
+        h->d_f, h->d_solid, d_rho, d_uy, x, h->nx, h->ny, h->nz, h->ncells, h->parity);
+
+    CUDA_CHECK(cudaMemcpyAsync(h_rho, d_rho, slice_bytes, cudaMemcpyDeviceToHost, h->stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_uy, d_uy, slice_bytes, cudaMemcpyDeviceToHost, h->stream));
+    CUDA_CHECK(cudaStreamSynchronize(h->stream));
+    cudaFree(d_rho);
+    cudaFree(d_uy);
+    return 0;
+}
+
+LBM_API int lbm_get_x_temp_slice(void* handle, int x, float* h_temp) {
+    if (!handle || !h_temp) return -1;
+    LBMHandle* h = (LBMHandle*)handle;
+    if (!h->thermal_enabled || x < 0 || x >= h->nx) return -1;
+
+    size_t slice_bytes = (size_t)h->nz * (size_t)h->ny * sizeof(float);
+    float* d_temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_temp, slice_bytes));
+
+    dim3 blk(32, 8);
+    dim3 grd((h->ny + blk.x - 1) / blk.x, (h->nz + blk.y - 1) / blk.y);
+    k_extract_x_temp_slice<<<grd, blk, 0, h->stream>>>(
+        h->d_g, d_temp, x, h->nx, h->ny, h->nz, h->ncells);
     CUDA_CHECK(cudaMemcpyAsync(h_temp, d_temp, slice_bytes, cudaMemcpyDeviceToHost, h->stream));
     CUDA_CHECK(cudaStreamSynchronize(h->stream));
     cudaFree(d_temp);

@@ -67,6 +67,10 @@ def load_lib(dll_path: str = _DLL) -> ctypes.CDLL:
     lib.lbm_get_y_temp_plane.restype = ctypes.c_int
     lib.lbm_get_z_temp_slice.argtypes = [ctypes.c_void_p, ctypes.c_int, cf_p]
     lib.lbm_get_z_temp_slice.restype = ctypes.c_int
+    lib.lbm_get_x_slice.argtypes = [ctypes.c_void_p, ctypes.c_int, cf_p, cf_p]
+    lib.lbm_get_x_slice.restype = ctypes.c_int
+    lib.lbm_get_x_temp_slice.argtypes = [ctypes.c_void_p, ctypes.c_int, cf_p]
+    lib.lbm_get_x_temp_slice.restype = ctypes.c_int
     lib.lbm_destroy.argtypes = [ctypes.c_void_p]
     lib.lbm_destroy.restype = None
     _LIB = lib
@@ -140,6 +144,24 @@ class LBMCudaSolver:
         temp = np.empty((self.ny, self.nx), dtype=np.float32)
         self._lib.lbm_get_z_temp_slice(
             self._h, int(z),
+            temp.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        return temp
+
+    def x_slice(self, x: int):
+        rho = np.empty((self.nz, self.ny), dtype=np.float32)
+        uy = np.empty((self.nz, self.ny), dtype=np.float32)
+        self._lib.lbm_get_x_slice(
+            self._h, int(x),
+            rho.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            uy.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        return uy, rho
+
+    def x_temp_slice(self, x: int):
+        temp = np.empty((self.nz, self.ny), dtype=np.float32)
+        self._lib.lbm_get_x_temp_slice(
+            self._h, int(x),
             temp.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         )
         return temp
