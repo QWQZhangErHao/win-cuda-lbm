@@ -20,17 +20,27 @@ Windows native CUDA C++ D3Q19/D3Q7 Lattice Boltzmann solver (BGK + Smagorinsky L
 ## Build & Verify
 
 ```powershell
+# Auto-detect local GPU compute capability (e.g. sm_120, sm_89, sm_80)
 powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+# Or specify target architecture explicitly (e.g. A100: sm_80)
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Arch sm_80
+
 python .\lbm_cuda.py
 ```
 
-## Benchmark (RTX 5070 Ti Laptop 12GB, `sm_120`)
+## Benchmark
 
-| Case | Grid | Throughput | Notes |
-|---|---|---|---|
-| Poiseuille channel | `4 x 32 x 32` | ~348 MLUPS | Error `-0.09%` vs analytical |
-| 3D finned heat sink (flow) | `300 x 225 x 388` (26.19M) | ~2311 MLUPS | `1990 MB` VRAM |
-| 3D finned heat sink (flow + D3Q7 CHT) | `300 x 225 x 388` (26.19M) | ~1302 MLUPS | Coupled convection + conduction |
+Measured on a **300 × 225 × 388 (26.19M voxels)** 3D finned heat sink:
+
+| Backend & GPU | Mode | VRAM | Throughput | Notes |
+|---|---|---|---|---|
+| **Native CUDA C++** (RTX 5070 Ti Laptop 12GB, `sm_120`) | Flow (D3Q19) | `1990 MB` | **~2311 MLUPS** | AA-Pattern + CUDA Graph |
+| **Native CUDA C++** (RTX 5070 Ti Laptop 12GB, `sm_120`) | Flow + D3Q7 CHT | `2723 MB` | **~1302 MLUPS** | Coupled convection + conduction |
+| Baseline Numba CUDA (Cloud A100 40GB, `sm_80`) | Flow (D3Q19) | `~4.0 GB` | ~1293 MLUPS | `405s` for 20,000 steps (uncoalesced `4x4x4` block) |
+| Poiseuille channel (RTX 5070 Ti, `4 x 32 x 32`) | Flow (D3Q19) | `< 1 MB` | ~348 MLUPS | Error `-0.09%` vs analytical |
+
+> **A100 (`sm_80`, 40GB/80GB, 1555 GB/s HBM2e)**: Build with `-Arch sm_80` (or compile `.cu` directly with `nvcc` on Linux/Windows). With `76 B/voxel` AA-Pattern storage, a 40 GB A100 fits **400M+ voxels** in single-GPU VRAM.
 
 ## License
 
