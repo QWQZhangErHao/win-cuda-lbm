@@ -1,0 +1,9 @@
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.exe
+__pycache__/
+*.py[cod]
+*.npz
